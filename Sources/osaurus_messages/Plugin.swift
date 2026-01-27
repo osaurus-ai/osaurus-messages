@@ -412,8 +412,12 @@ private var api: osr_plugin_api = {
     let manifest = """
       {
         "plugin_id": "osaurus.messages",
-        "version": "0.1.0",
+        "name": "Messages",
         "description": "A messages plugin for macOS Messages.app integration - send and read iMessages",
+        "license": "MIT",
+        "authors": ["Dinoki Labs"],
+        "min_macos": "13.0",
+        "min_osaurus": "0.5.0",
         "capabilities": {
           "tools": [
             {
