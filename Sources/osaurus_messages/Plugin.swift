@@ -1,5 +1,6 @@
 import Cocoa
 import Foundation
+import SQLite3
 
 // MARK: - AppleScript Helper
 
@@ -21,37 +22,6 @@ private func runAppleScript(_ script: String) -> Result<String, Error> {
   }
 
   return .success(result.stringValue ?? "")
-}
-
-// MARK: - Shell Command Helper
-
-private func runCommand(_ command: String) -> Result<String, Error> {
-  let process = Process()
-  let pipe = Pipe()
-
-  process.executableURL = URL(fileURLWithPath: "/bin/zsh")
-  process.arguments = ["-c", command]
-  process.standardOutput = pipe
-  process.standardError = pipe
-
-  do {
-    try process.run()
-    process.waitUntilExit()
-
-    let data = pipe.fileHandleForReading.readDataToEndOfFile()
-    let output = String(data: data, encoding: .utf8) ?? ""
-
-    if process.terminationStatus != 0 {
-      return .failure(
-        NSError(
-          domain: "CommandError", code: Int(process.terminationStatus),
-          userInfo: [NSLocalizedDescriptionKey: output]))
-    }
-
-    return .success(output)
-  } catch {
-    return .failure(error)
-  }
 }
 
 // MARK: - Message Model
@@ -98,6 +68,79 @@ private func normalizePhoneNumber(_ phone: String) -> [String] {
 private func getMessagesDBPath() -> String {
   let home = FileManager.default.homeDirectoryForCurrentUser.path
   return "\(home)/Library/Messages/chat.db"
+}
+
+// MARK: - SQLite Query Helper
+
+private struct DatabaseError: Error {
+  let message: String
+}
+
+private let SQLITE_TRANSIENT_PTR = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+
+private func queryMessages(query: String, params: [String] = []) -> Result<[Message], DatabaseError>
+{
+  let dbPath = getMessagesDBPath()
+  var db: OpaquePointer?
+
+  let openResult = sqlite3_open_v2(dbPath, &db, SQLITE_OPEN_READONLY, nil)
+
+  guard openResult == SQLITE_OK, let db = db else {
+    let err = db.flatMap { String(cString: sqlite3_errmsg($0)) } ?? "Unknown error"
+    sqlite3_close(db)
+    if err.contains("unable to open") || err.contains("permission denied") {
+      return .failure(
+        DatabaseError(
+          message:
+            "Cannot access Messages database. Please grant Full Disk Access to the application in System Settings > Privacy & Security > Full Disk Access."
+        ))
+    }
+    return .failure(DatabaseError(message: "Database error: \(err)"))
+  }
+  defer { sqlite3_close(db) }
+
+  var stmt: OpaquePointer?
+  guard sqlite3_prepare_v2(db, query, -1, &stmt, nil) == SQLITE_OK else {
+    let err = String(cString: sqlite3_errmsg(db))
+    return .failure(DatabaseError(message: "Query error: \(err)"))
+  }
+  defer { sqlite3_finalize(stmt) }
+
+  // Bind string parameters
+  for (i, param) in params.enumerated() {
+    sqlite3_bind_text(stmt, Int32(i + 1), param, -1, SQLITE_TRANSIENT_PTR)
+  }
+
+  var messages: [Message] = []
+  while sqlite3_step(stmt) == SQLITE_ROW {
+    // Read each column, handling NULLs per-row so one bad row doesn't destroy all results
+    let content = sqlite3_column_text(stmt, 0).map { String(cString: $0) } ?? "[No content]"
+    let date = sqlite3_column_text(stmt, 1).map { String(cString: $0) } ?? "Unknown"
+    let sender = sqlite3_column_text(stmt, 2).map { String(cString: $0) } ?? "Unknown"
+    let isFromMe = sqlite3_column_int(stmt, 3) == 1
+    let hasAttachments = sqlite3_column_int(stmt, 4) == 1
+    let attachmentInfo = sqlite3_column_text(stmt, 5).map { String(cString: $0) }
+
+    var attachments: [String]? = nil
+    if hasAttachments {
+      if let info = attachmentInfo, !info.isEmpty {
+        attachments = info.components(separatedBy: ",")
+      } else {
+        attachments = ["[Attachment]"]
+      }
+    }
+
+    messages.append(
+      Message(
+        content: content,
+        date: date,
+        sender: sender,
+        isFromMe: isFromMe,
+        attachments: attachments
+      ))
+  }
+
+  return .success(messages)
 }
 
 // MARK: - Send Message Tool
@@ -163,56 +206,41 @@ private struct ReadMessagesTool {
     let limit = min(input.limit ?? 10, 50)
     let phoneNumbers = normalizePhoneNumber(input.phoneNumber)
 
-    guard !phoneNumbers.isEmpty else {
+    guard let phoneNumber = phoneNumbers.first else {
       return "{\"error\": \"Invalid phone number format\"}"
     }
-
-    // Build SQL conditions for phone number variants
-    let phoneConditions = phoneNumbers.map { "h.id = '\($0)'" }.joined(separator: " OR ")
-
-    let dbPath = getMessagesDBPath()
 
     let query = """
       SELECT
           CASE
               WHEN m.text IS NOT NULL AND m.text != '' THEN m.text
-              ELSE '[Media or unsupported content]'
+              WHEN m.attributedBody IS NOT NULL THEN '[Rich text message]'
+              ELSE '[Attachment]'
           END as content,
           datetime(m.date/1000000000 + strftime('%s', '2001-01-01'), 'unixepoch', 'localtime') as date,
-          h.id as sender,
+          COALESCE(h.id, 'Me') as sender,
           m.is_from_me,
-          m.cache_has_attachments
+          m.cache_has_attachments,
+          GROUP_CONCAT(DISTINCT a.transfer_name) as attachment_names
       FROM message m
-      INNER JOIN handle h ON h.ROWID = m.handle_id
-      WHERE (\(phoneConditions))
-          AND (m.text IS NOT NULL OR m.cache_has_attachments = 1)
+      LEFT JOIN handle h ON h.ROWID = m.handle_id
+      LEFT JOIN message_attachment_join maj ON maj.message_id = m.ROWID
+      LEFT JOIN attachment a ON a.ROWID = maj.attachment_id
+      WHERE h.id = ?
+          AND (m.text IS NOT NULL OR m.attributedBody IS NOT NULL OR m.cache_has_attachments = 1)
           AND m.item_type = 0
+      GROUP BY m.ROWID
       ORDER BY m.date DESC
       LIMIT \(limit)
       """
 
-    let escapedQuery = query.replacingOccurrences(of: "\"", with: "\\\"").replacingOccurrences(
-      of: "\n", with: " ")
-    let command = "sqlite3 -json \"\(dbPath)\" \"\(escapedQuery)\""
-
-    let result = runCommand(command)
+    let result = queryMessages(query: query, params: [phoneNumber])
 
     switch result {
-    case .success(let output):
-      if output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-        return "[]"
-      }
-      let messages = parseMessagesJSON(output)
+    case .success(let messages):
       return encodeJSON(messages)
     case .failure(let error):
-      let errorMessage = error.localizedDescription
-      if errorMessage.contains("unable to open database")
-        || errorMessage.contains("permission denied")
-      {
-        return
-          "{\"error\": \"Cannot access Messages database. Please grant Full Disk Access to the application in System Settings > Privacy & Security > Full Disk Access.\"}"
-      }
-      return "{\"error\": \"\(escapeJSON(errorMessage))\"}"
+      return "{\"error\": \"\(escapeJSON(error.message))\"}"
     }
   }
 }
@@ -227,66 +255,47 @@ private struct GetUnreadMessagesTool {
   }
 
   func run(args: String) -> String {
-    guard let data = args.data(using: .utf8),
+    let limit: Int
+    if let data = args.data(using: .utf8),
       let input = try? JSONDecoder().decode(Args.self, from: data)
-    else {
-      // Empty args is valid, use defaults
-      return runWithDefaults()
+    {
+      limit = min(input.limit ?? 10, 50)
+    } else {
+      limit = 10
     }
-
-    return runWithLimit(input.limit ?? 10)
-  }
-
-  private func runWithDefaults() -> String {
-    return runWithLimit(10)
-  }
-
-  private func runWithLimit(_ limit: Int) -> String {
-    let maxLimit = min(limit, 50)
-    let dbPath = getMessagesDBPath()
 
     let query = """
       SELECT
           CASE
               WHEN m.text IS NOT NULL AND m.text != '' THEN m.text
-              ELSE '[Media or unsupported content]'
+              WHEN m.attributedBody IS NOT NULL THEN '[Rich text message]'
+              ELSE '[Attachment]'
           END as content,
           datetime(m.date/1000000000 + strftime('%s', '2001-01-01'), 'unixepoch', 'localtime') as date,
-          h.id as sender,
+          COALESCE(h.id, 'Unknown') as sender,
           m.is_from_me,
-          m.cache_has_attachments
+          m.cache_has_attachments,
+          GROUP_CONCAT(DISTINCT a.transfer_name) as attachment_names
       FROM message m
-      INNER JOIN handle h ON h.ROWID = m.handle_id
+      LEFT JOIN handle h ON h.ROWID = m.handle_id
+      LEFT JOIN message_attachment_join maj ON maj.message_id = m.ROWID
+      LEFT JOIN attachment a ON a.ROWID = maj.attachment_id
       WHERE m.is_from_me = 0
           AND m.is_read = 0
-          AND (m.text IS NOT NULL OR m.cache_has_attachments = 1)
+          AND (m.text IS NOT NULL OR m.attributedBody IS NOT NULL OR m.cache_has_attachments = 1)
           AND m.item_type = 0
+      GROUP BY m.ROWID
       ORDER BY m.date DESC
-      LIMIT \(maxLimit)
+      LIMIT \(limit)
       """
 
-    let escapedQuery = query.replacingOccurrences(of: "\"", with: "\\\"").replacingOccurrences(
-      of: "\n", with: " ")
-    let command = "sqlite3 -json \"\(dbPath)\" \"\(escapedQuery)\""
-
-    let result = runCommand(command)
+    let result = queryMessages(query: query)
 
     switch result {
-    case .success(let output):
-      if output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-        return "[]"
-      }
-      let messages = parseMessagesJSON(output)
+    case .success(let messages):
       return encodeJSON(messages)
     case .failure(let error):
-      let errorMessage = error.localizedDescription
-      if errorMessage.contains("unable to open database")
-        || errorMessage.contains("permission denied")
-      {
-        return
-          "{\"error\": \"Cannot access Messages database. Please grant Full Disk Access to the application in System Settings > Privacy & Security > Full Disk Access.\"}"
-      }
-      return "{\"error\": \"\(escapeJSON(errorMessage))\"}"
+      return "{\"error\": \"\(escapeJSON(error.message))\"}"
     }
   }
 }
@@ -308,35 +317,6 @@ private func escapeJSON(_ str: String) -> String {
     .replacingOccurrences(of: "\n", with: "\\n")
     .replacingOccurrences(of: "\r", with: "\\r")
     .replacingOccurrences(of: "\t", with: "\\t")
-}
-
-private struct SQLiteMessage: Decodable {
-  let content: String
-  let date: String
-  let sender: String
-  let is_from_me: Int
-  let cache_has_attachments: Int
-}
-
-private func parseMessagesJSON(_ jsonOutput: String) -> [Message] {
-  guard let data = jsonOutput.data(using: .utf8) else {
-    return []
-  }
-
-  do {
-    let sqliteMessages = try JSONDecoder().decode([SQLiteMessage].self, from: data)
-    return sqliteMessages.map { msg in
-      Message(
-        content: msg.content,
-        date: msg.date,
-        sender: msg.sender,
-        isFromMe: msg.is_from_me == 1,
-        attachments: msg.cache_has_attachments == 1 ? ["[Has attachments]"] : nil
-      )
-    }
-  } catch {
-    return []
-  }
 }
 
 private func encodeJSON<T: Encodable>(_ value: T) -> String {

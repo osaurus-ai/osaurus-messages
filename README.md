@@ -1,6 +1,6 @@
 # osaurus-messages
 
-An Osaurus plugin for interacting with macOS Messages.app. Send and read iMessages programmatically. Based on [apple-mcp message.ts](https://github.com/supermemoryai/apple-mcp/blob/main/utils/message.ts).
+An Osaurus plugin for interacting with macOS Messages.app. Send and read iMessages programmatically.
 
 ## Prerequisites
 
@@ -24,7 +24,7 @@ Add the application using this plugin. This is required to access the Messages d
 
 ### `send_message`
 
-Send an iMessage to a phone number.
+Send an iMessage to a phone number. Uses AppleScript to interact with Messages.app directly.
 
 **Parameters:**
 
@@ -51,7 +51,7 @@ Send an iMessage to a phone number.
 
 ### `read_messages`
 
-Read message history from a specific contact.
+Read message history from a specific contact. Queries the Messages database directly using the native SQLite C API.
 
 **Parameters:**
 
@@ -79,18 +79,18 @@ Read message history from a specific contact.
     "attachments": null
   },
   {
-    "content": "I'm good, thanks!",
+    "content": "Check out this photo",
     "date": "2024-01-15 14:32:00",
     "sender": "+15551234567",
     "isFromMe": true,
-    "attachments": null
+    "attachments": ["photo.jpg"]
   }
 ]
 ```
 
 ### `get_unread_messages`
 
-Get all unread messages from all contacts.
+Get all unread messages from all contacts. Queries the Messages database directly using the native SQLite C API.
 
 **Parameters:**
 
@@ -120,15 +120,20 @@ Get all unread messages from all contacts.
 
 ## Message Object Format
 
-All message-related tools return messages in this format:
+All message-reading tools return messages in this format:
 
-| Field         | Type       | Description                                 |
-| ------------- | ---------- | ------------------------------------------- |
-| `content`     | `string`   | The message text content                    |
-| `date`        | `string`   | Date/time the message was sent (local time) |
-| `sender`      | `string`   | Phone number or email of the sender         |
-| `isFromMe`    | `boolean`  | Whether you sent this message               |
-| `attachments` | `string[]` | List of attachment indicators (if any)      |
+| Field         | Type       | Description                                                                                           |
+| ------------- | ---------- | ----------------------------------------------------------------------------------------------------- |
+| `content`     | `string`   | The message text, `[Rich text message]` for formatted messages, or `[Attachment]` for media-only messages |
+| `date`        | `string`   | Date/time the message was sent (local time)                                                           |
+| `sender`      | `string`   | Phone number or email of the sender (`Me` or `Unknown` when unavailable)                              |
+| `isFromMe`    | `boolean`  | Whether you sent this message                                                                         |
+| `attachments` | `string[]` | List of attachment filenames (e.g., `["photo.jpg", "document.pdf"]`), or `null` if none               |
+
+## Architecture
+
+- **Sending messages**: Uses `NSAppleScript` to interact with Messages.app via AppleScript. Requires Automation permissions.
+- **Reading messages**: Uses the native SQLite C API (`import SQLite3`) to query `~/Library/Messages/chat.db` directly in read-only mode. Requires Full Disk Access. All queries use parameterized bindings to prevent injection.
 
 ## Development
 
@@ -183,6 +188,14 @@ This typically means:
 
 Ensure you've granted Automation permissions and that Messages.app is properly configured with your iMessage account.
 
+### Messages showing as "[Rich text message]"
+
+Some messages use rich formatting (links, mentions, reactions) and store text in a binary format (`attributedBody`) that cannot be directly read as plain text. The actual message content exists but is displayed with this placeholder.
+
+### Messages showing as "[Attachment]"
+
+These are media-only messages (photos, videos, audio) with no accompanying text. The attachment filenames are returned in the `attachments` field when available.
+
 ## Credits
 
-- [apple-mcp](https://github.com/supermemoryai/apple-mcp) by supermemoryai
+- Inspired by [apple-mcp](https://github.com/supermemoryai/apple-mcp) by supermemoryai
