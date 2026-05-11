@@ -422,6 +422,7 @@ private var api: osr_plugin_api = {
             },
             {
               "id": "read_messages",
+              "widget": true,
               "description": "Read message history from a specific contact",
               "parameters": {
                 "type": "object",
@@ -442,6 +443,7 @@ private var api: osr_plugin_api = {
             },
             {
               "id": "get_unread_messages",
+              "widget": true,
               "description": "Get all unread messages from all contacts",
               "parameters": {
                 "type": "object",
